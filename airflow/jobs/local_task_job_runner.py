@@ -26,6 +26,7 @@ from airflow.configuration import conf
 from airflow.exceptions import AirflowException
 from airflow.jobs.base_job_runner import BaseJobRunner
 from airflow.jobs.job import perform_heartbeat
+from airflow.listeners.listener import get_listener_manager
 from airflow.models.taskinstance import TaskReturnCode
 from airflow.stats import Stats
 from airflow.utils import timezone
@@ -110,6 +111,8 @@ class LocalTaskJobRunner(BaseJobRunner, LoggingMixin):
         self.terminating = False
 
         self._state_change_checks = 0
+        # time spend after task completed, but before it exited - used to measure listener execution time
+        self._overtime = 0.0
 
     def _execute(self) -> int | None:
         from airflow.task.task_runner import get_task_runner
@@ -195,7 +198,6 @@ class LocalTaskJobRunner(BaseJobRunner, LoggingMixin):
                         self.job.heartrate if self.job.heartrate is not None else heartbeat_time_limit,
                     ),
                 )
-
                 return_code = self.task_runner.return_code(timeout=max_wait_time)
                 if return_code is not None:
                     self.handle_task_exit(return_code)
@@ -290,6 +292,7 @@ class LocalTaskJobRunner(BaseJobRunner, LoggingMixin):
                 )
                 raise AirflowException("PID of job runner does not match")
         elif self.task_runner.return_code() is None and hasattr(self.task_runner, "process"):
+            self._overtime = (timezone.utcnow() - (ti.end_date or timezone.utcnow())).total_seconds()
             if ti.state == TaskInstanceState.SKIPPED:
                 # A DagRun timeout will cause tasks to be externally marked as skipped.
                 dagrun = ti.get_dagrun(session=session)
@@ -303,6 +306,14 @@ class LocalTaskJobRunner(BaseJobRunner, LoggingMixin):
                 if dagrun_timeout and execution_time > dagrun_timeout:
                     self.log.warning("DagRun timed out after %s.", execution_time)
 
+            # If process still runs after being marked as success, let it run until configured overtime
+            # if there are configured listeners
+            if (
+                ti.state == TaskInstanceState.SUCCESS
+                and self._overtime < conf.getint("core", "task_listener_timeout")
+                and get_listener_manager().has_listeners
+            ):
+                return
             # potential race condition, the _run_raw_task commits `success` or other state
             # but task_runner does not exit right away due to slow process shutdown or any other reasons
             # let's do a throttle here, if the above case is true, the handle_task_exit will handle it
