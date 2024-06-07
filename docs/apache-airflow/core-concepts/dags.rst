@@ -335,7 +335,7 @@ The ``@task.branch`` can also be used with XComs allowing branching context to d
 .. code-block:: python
 
     @task.branch(task_id="branch_task")
-    def branch_func(ti=None):
+    def branch_func(ti):
         xcom_value = int(ti.xcom_pull(task_ids="start_task"))
         if xcom_value >= 5:
             return "continue_task"
